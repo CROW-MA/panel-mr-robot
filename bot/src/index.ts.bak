@@ -1,0 +1,703 @@
+import { Client, LocalAuth } from "whatsapp-web.js";
+import qrcode from "qrcode-terminal";
+import dotenv from "dotenv";
+import express from "express";
+import { execSync } from "child_process";
+import { pool } from "./db";
+import { v4 as uuidv4 } from "uuid";
+
+dotenv.config();
+
+const clients:   Record<string, Client> = {};
+const qrCodes:   Record<string, string> = {};
+const botStatus: Record<string, "starting" | "qr" | "online" | "offline" | "error"> = {};
+const starting:  Set<string> = new Set();
+const flowCache: Record<string, any> = {};
+let launchQueue: Promise<void> = Promise.resolve();
+
+process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
+process.on("uncaughtException",  (err) => console.error("uncaughtException:",  err));
+
+/* ================================================================
+   UTILS
+================================================================ */
+function normalizeText(text: string): string {
+  return text.toLowerCase().normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "").replace(/[^\w\s]/gi, "").trim();
+}
+
+function parseFlow(flowJson: any): any {
+  try { return typeof flowJson === "string" ? JSON.parse(flowJson) : flowJson; }
+  catch { return null; }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function cleanSessionLocks(clientId: string): void {
+  const p = `/opt/waas/bot/sessions/session-${clientId}`;
+  try { execSync(`rm -f "${p}/SingletonLock" "${p}/SingletonCookie" "${p}/SingletonSocket" "${p}/DevToolsActivePort"`, { stdio: "ignore" }); } catch {}
+  try { execSync(`rm -rf /tmp/com.google.Chrome.*`, { stdio: "ignore" }); } catch {}
+}
+
+/* ================================================================
+   MATCH OPTION — reconoce texto, número de posición y emoji
+================================================================ */
+function matchOption(userText: string, normalized: string, options: Record<string, string>): string | null {
+  const keys = Object.keys(options);
+  for (const key of keys) {
+    if (normalizeText(key) === normalized || key === userText) return options[key];
+    const m = key.match(/^(\d+)/);
+    if (m && m[1] === normalized) return options[key];
+  }
+  const idx = parseInt(normalized, 10);
+  if (!isNaN(idx) && idx >= 1 && idx <= keys.length) return options[keys[idx - 1]];
+  return null;
+}
+
+/* ================================================================
+   DETECTOR DE TIPO DE PASO
+================================================================ */
+type StepType = "menu" | "message" | "location" | "link" | "agenda" | "human" | "collect";
+
+function getStepType(step: any): StepType {
+  if (step.type === "location") return "location";
+  // Si el paso tiene type explícito, usarlo
+  if (step.type) return step.type as StepType;
+
+  // Detección automática por ID (retrocompatibilidad)
+  const id = step.id.toLowerCase();
+  const humanKw = ["asesor","human","humano","agente","vendedor","soporte","operador","persona"];
+  const agendaKw = ["agend","cita","reserva","turno","appointment","booking"];
+
+  if (humanKw.some(k => id.includes(k))) return "human";
+  if (agendaKw.some(k => id.includes(k))) return "agenda";
+  if (Object.keys(step.next || {}).length > 0) return "menu";
+  return "message";
+}
+
+/* ================================================================
+   DB HELPERS
+================================================================ */
+async function getActiveBusinesses() {
+  const { rows } = await pool.query(
+    "SELECT id, name, client_id, whatsapp_number FROM businesses WHERE is_active = true"
+  );
+  return rows;
+}
+
+async function getBotFlow(businessId: string): Promise<any> {
+  if (flowCache[businessId]) return flowCache[businessId];
+  const { rows } = await pool.query("SELECT flow_json FROM bot_configs WHERE business_id=$1", [businessId]);
+  if (!rows[0]) return null;
+  const flow = parseFlow(rows[0].flow_json);
+  if (flow) flowCache[businessId] = flow;
+  return flow;
+}
+
+function reloadFlow(businessId: string): void {
+  delete flowCache[businessId];
+  console.log(`🔄 Flow recargado: ${businessId}`);
+}
+
+async function createNotification(businessId: string, type: string, title: string, body: string, phone: string): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO notifications (id, business_id, type, title, body, phone) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [uuidv4(), businessId, type, title, body, phone]
+    );
+  } catch (err) { console.error("❌ Notificación error:", err); }
+}
+
+async function notifyOwner(business: { id: string; name: string; whatsapp_number: string }, clientPhone: string, type: "human" | "agenda", extra?: string): Promise<void> {
+  try {
+    const ownerClient = clients[business.id];
+    if (!ownerClient || botStatus[business.id] !== "online") return;
+    const ownerNumber = business.whatsapp_number.replace(/\D/g, "");
+    if (!ownerNumber || ownerNumber === clientPhone) return;
+    const now = new Date().toLocaleString("es-CO", { timeZone: "America/Bogota", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+    const msg = type === "agenda"
+      ? `📅 *Nueva cita agendada*\n\n🏢 *Negocio:* ${business.name}\n📱 *Cliente:* +${clientPhone}\n🕐 *Registrada:* ${now}${extra ? `\n📋 *Detalles:* ${extra}` : ""}\n\n👉 https://wa.me/${clientPhone}`
+      : `👤 *Cliente solicita asesor*\n\n🏢 *Negocio:* ${business.name}\n📱 *Cliente:* +${clientPhone}\n🕐 *Hora:* ${now}\n\n👉 https://wa.me/${clientPhone}`;
+    await ownerClient.sendMessage(`${ownerNumber}@c.us`, msg);
+    console.log(`🔔 Dueño notificado [${business.name}]: ${type}`);
+  } catch (err) { console.error("❌ Error notificando dueño:", err); }
+}
+
+/* ================================================================
+   AGENDAMIENTO INTELIGENTE
+   Maneja el flujo conversacional de citas paso a paso
+================================================================ */
+async function handleAgendaFlow(
+  msg: any,
+  business: { id: string; name: string; whatsapp_number: string },
+  conv: any,
+  step: any,
+  text: string
+): Promise<void> {
+  const ctx = conv.context_json || {};
+  const agendaCtx = ctx.agenda || {};
+  const duration = step.metadata?.duration_minutes || 30;
+  const services: string[] = step.metadata?.services || [];
+  const normalized = normalizeText(text);
+
+  // PASO 0: Si hay lista de servicios y no se ha elegido uno → mostrar lista
+  if (services.length > 0 && !agendaCtx.service) {
+    // Ver si el cliente eligió un número o el nombre del servicio
+    const numChoice = parseInt(normalized, 10);
+    let chosenService: string | null = null;
+
+    if (!isNaN(numChoice) && numChoice >= 1 && numChoice <= services.length) {
+      chosenService = services[numChoice - 1];
+    } else {
+      chosenService = services.find((s: string) => normalizeText(s).includes(normalized) || normalized.includes(normalizeText(s))) || null;
+    }
+
+    if (!chosenService) {
+      // Mostrar lista de servicios
+      const serviceList = services.map((s: string, i: number) => {
+        const emojis = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
+        return `${emojis[i] ?? `${i+1}.`} ${s}`;
+      }).join("\n");
+      await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+        JSON.stringify({ ...ctx, agenda: { ...agendaCtx, step: "waiting_service" } }),
+        conv.id
+      ]);
+      await sleep(800);
+      await msg.reply(`${step.message}
+
+${serviceList}
+
+Escribe el número de tu servicio.`);
+      return;
+    }
+
+    // Cliente eligió un servicio — notificar al asesor y silenciar bot
+    await pool.query(
+      `UPDATE conversations SET mode='human', current_step=$1, requests_human=true, human_taken_at=NOW() WHERE id=$2`,
+      [step.id, conv.id]
+    );
+    await createNotification(
+      business.id, "agenda_request",
+      "📅 Nueva solicitud de cita",
+      `+${conv.user_phone} quiere agendar: ${chosenService}`,
+      conv.user_phone
+    );
+    await notifyOwner(business, conv.user_phone, "agenda", `Servicio: ${chosenService}`);
+    await sleep(800);
+    await msg.reply(`✅ Perfecto. Has elegido: *${chosenService}*
+
+Un asesor se pondrá en contacto contigo en breve para coordinar el horario. 🗓
+
+Escribe *menu* si necesitas algo más.`);
+    return;
+  }
+
+  // Si no hay lista de servicios — flujo de agendamiento automático con horario
+  // PASO 1: Pedir nombre
+  if (!agendaCtx.name) {
+    await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+      JSON.stringify({ ...ctx, agenda: { ...agendaCtx, step: "waiting_name", service: step.metadata?.service || step.id } }),
+      conv.id
+    ]);
+    await sleep(800);
+    await msg.reply(`📝 Para agendar tu cita, ¿cuál es tu nombre completo?`);
+    return;
+  }
+
+  // PASO 2: Pedir fecha/hora o confirmar el slot sugerido
+  if (!agendaCtx.confirmed) {
+    if (agendaCtx.step === "waiting_name") {
+      // Guardar nombre y buscar próximo slot
+      const nextSlot = await getNextAvailableSlot(business.id, duration);
+      const slotText = nextSlot
+        ? `📅 *${formatDate(nextSlot.date)}* a las *${nextSlot.time}*`
+        : "❌ No encontré disponibilidad esta semana";
+
+      await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+        JSON.stringify({ ...ctx, agenda: { ...agendaCtx, name: text, step: "waiting_confirm", slot: nextSlot } }),
+        conv.id
+      ]);
+      await sleep(800);
+      if (nextSlot) {
+        await msg.reply(
+          `Perfecto *${text}* 👋\n\n` +
+          `El próximo horario disponible es:\n${slotText}\n\n` +
+          `¿Confirmas esta cita? Responde *sí* para confirmar o escribe una hora diferente (ej: *mañana 3pm*)`
+        );
+      } else {
+        await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+          JSON.stringify({ ...ctx, agenda: null }),
+          conv.id
+        ]);
+        await msg.reply(`Lo siento, no hay disponibilidad esta semana. Escribe *menu* para ver otras opciones.`);
+      }
+      return;
+    }
+
+    if (agendaCtx.step === "waiting_confirm") {
+      const normalized = normalizeText(text);
+
+      // Confirmación
+      if (["si","sí","yes","ok","confirmo","dale","listo","perfecto"].some(w => normalized.includes(w))) {
+        if (!agendaCtx.slot) {
+          await msg.reply(`Lo siento, no encontré un horario disponible. Escribe *menu* para volver.`);
+          return;
+        }
+
+        // Guardar cita en DB
+        await pool.query(
+          `INSERT INTO appointments (id, business_id, client_phone, client_name, service, appointment_date, appointment_time, duration_minutes, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'confirmed')`,
+          [uuidv4(), business.id, conv.user_phone, agendaCtx.name, agendaCtx.service, agendaCtx.slot.date, agendaCtx.slot.time, duration]
+        );
+
+        const confirmMsg = `✅ *¡Cita confirmada!*\n\n👤 *Nombre:* ${agendaCtx.name}\n📅 *Fecha:* ${formatDate(agendaCtx.slot.date)}\n🕐 *Hora:* ${agendaCtx.slot.time}\n\nTe esperamos. Escribe *menu* si necesitas algo más.`;
+
+        // Crear notificación y notificar dueño
+        await createNotification(business.id, "agenda_request", "📅 Nueva cita confirmada",
+          `${agendaCtx.name} (+${conv.user_phone}) — ${formatDate(agendaCtx.slot.date)} ${agendaCtx.slot.time}`, conv.user_phone);
+        await notifyOwner(business, conv.user_phone, "agenda",
+          `${agendaCtx.name} — ${formatDate(agendaCtx.slot.date)} ${agendaCtx.slot.time}`);
+
+        // Limpiar contexto de agenda
+        await pool.query(`UPDATE conversations SET context_json=$1, current_step='start' WHERE id=$2`, [
+          JSON.stringify({ ...ctx, agenda: null }),
+          conv.id
+        ]);
+
+        await sleep(800);
+        await msg.reply(confirmMsg);
+        return;
+      }
+
+      // Intentó escribir una hora diferente — intentar parsear
+      const customSlot = parseCustomDateTime(text);
+      if (customSlot) {
+        // Verificar disponibilidad del slot solicitado
+        const { rows: conflict } = await pool.query(
+          `SELECT id FROM appointments WHERE business_id=$1 AND appointment_date=$2 AND appointment_time=$3 AND status!='cancelled'`,
+          [business.id, customSlot.date, customSlot.time]
+        );
+        if (conflict.length > 0) {
+          const nextSlot = await getNextAvailableSlot(business.id, duration);
+          await msg.reply(`❌ Ese horario ya está ocupado.\n\nEl siguiente disponible es:\n📅 *${formatDate(nextSlot!.date)}* a las *${nextSlot!.time}*\n\n¿Confirmas? Responde *sí* o escribe otro horario.`);
+          await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+            JSON.stringify({ ...ctx, agenda: { ...agendaCtx, slot: nextSlot } }),
+            conv.id
+          ]);
+        } else {
+          await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [
+            JSON.stringify({ ...ctx, agenda: { ...agendaCtx, slot: customSlot } }),
+            conv.id
+          ]);
+          await msg.reply(`📅 Entendido. ¿Confirmas para el *${formatDate(customSlot.date)}* a las *${customSlot.time}*?\n\nResponde *sí* para confirmar.`);
+        }
+        return;
+      }
+
+      // No entendió
+      await msg.reply(`No entendí 😅 Responde *sí* para confirmar el horario sugerido, o escribe una hora diferente (ej: *mañana 4pm*, *viernes 10am*)`);
+      return;
+    }
+  }
+}
+
+/* ── HELPER: próximo slot disponible ── */
+async function getNextAvailableSlot(businessId: string, duration: number): Promise<{ date: string; time: string } | null> {
+  const startHour = 8;
+  const endHour = 20;
+  const now = new Date();
+
+  const { rows: existing } = await pool.query(
+    `SELECT appointment_date, appointment_time, duration_minutes FROM appointments
+     WHERE business_id=$1 AND appointment_date >= CURRENT_DATE AND status!='cancelled'
+     ORDER BY appointment_date, appointment_time`,
+    [businessId]
+  );
+
+  const occupied = new Set<string>();
+  for (const appt of existing) {
+    const d = appt.appointment_date.toISOString().split("T")[0];
+    const [h, m] = appt.appointment_time.split(":");
+    const startMin = parseInt(h) * 60 + parseInt(m);
+    const dur = appt.duration_minutes || 30;
+    for (let i = 0; i < dur; i += 30) {
+      const totalMin = startMin + i;
+      const hh = Math.floor(totalMin / 60).toString().padStart(2, "0");
+      const mm = (totalMin % 60).toString().padStart(2, "0");
+      occupied.add(`${d}_${hh}:${mm}`);
+    }
+  }
+
+  const checkDate = new Date(now);
+  for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
+    const dateStr = checkDate.toISOString().split("T")[0];
+    const startMin = dayOffset === 0
+      ? Math.ceil((now.getHours() * 60 + now.getMinutes() + 30) / 30) * 30
+      : startHour * 60;
+
+    for (let min = startMin; min < endHour * 60; min += 30) {
+      const hh = Math.floor(min / 60).toString().padStart(2, "0");
+      const mm = (min % 60).toString().padStart(2, "0");
+      let slotFree = true;
+      for (let i = 0; i < duration; i += 30) {
+        const totalMin = min + i;
+        const sh = Math.floor(totalMin / 60).toString().padStart(2, "0");
+        const sm = (totalMin % 60).toString().padStart(2, "0");
+        if (occupied.has(`${dateStr}_${sh}:${sm}`)) { slotFree = false; break; }
+      }
+      if (slotFree) return { date: dateStr, time: `${hh}:${mm}` };
+    }
+    checkDate.setDate(checkDate.getDate() + 1);
+  }
+  return null;
+}
+
+/* ── HELPER: parsear fecha/hora en lenguaje natural ── */
+function parseCustomDateTime(text: string): { date: string; time: string } | null {
+  const t = text.toLowerCase();
+  const now = new Date();
+
+  // Detectar día
+  let targetDate = new Date(now);
+  if (t.includes("mañana") || t.includes("manana")) targetDate.setDate(now.getDate() + 1);
+  else if (t.includes("lunes")) { const d = 1; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+  else if (t.includes("martes")) { const d = 2; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+  else if (t.includes("miércoles") || t.includes("miercoles")) { const d = 3; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+  else if (t.includes("jueves")) { const d = 4; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+  else if (t.includes("viernes")) { const d = 5; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+  else if (t.includes("sábado") || t.includes("sabado")) { const d = 6; while (targetDate.getDay() !== d) targetDate.setDate(targetDate.getDate() + 1); }
+
+  // Detectar hora
+  const hourMatch = t.match(/(\d{1,2})\s*(?::|h|am|pm)?(\d{0,2})\s*(am|pm)?/i);
+  if (!hourMatch) return null;
+
+  let hour = parseInt(hourMatch[1]);
+  const min = parseInt(hourMatch[2] || "0") || 0;
+  const meridian = (hourMatch[3] || "").toLowerCase();
+  if (meridian === "pm" && hour < 12) hour += 12;
+  if (meridian === "am" && hour === 12) hour = 0;
+  if (hour < 8 || hour >= 20) return null;
+
+  const dateStr = targetDate.toISOString().split("T")[0];
+  const timeStr = `${hour.toString().padStart(2, "0")}:${min.toString().padStart(2, "0")}`;
+  return { date: dateStr, time: timeStr };
+}
+
+/* ── HELPER: formatear fecha legible ── */
+function formatDate(dateStr: string): string {
+  const d = new Date(dateStr + "T12:00:00");
+  return d.toLocaleDateString("es-CO", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+}
+
+/* ================================================================
+   START CLIENT
+================================================================ */
+function startClient(business: { id: string; name: string; client_id: string; whatsapp_number: string }, attempt = 1): void {
+  if (!business?.client_id || clients[business.id] || starting.has(business.client_id)) return;
+  starting.add(business.client_id);
+  botStatus[business.id] = "starting";
+  launchQueue = launchQueue.then(async () => {
+    if (clients[business.id]) { starting.delete(business.client_id); return; }
+    console.log(`🚀 Iniciando [intento ${attempt}]: ${business.name}`);
+    cleanSessionLocks(business.client_id);
+    await _doStartClient(business, attempt);
+    await sleep(8000);
+  });
+}
+
+async function _doStartClient(business: { id: string; name: string; client_id: string; whatsapp_number: string }, attempt: number): Promise<void> {
+  const client = new Client({
+    authStrategy: new LocalAuth({ clientId: business.client_id, dataPath: "/opt/waas/bot/sessions" }),
+    puppeteer: {
+      headless: true,
+      args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-accelerated-2d-canvas","--no-first-run","--no-zygote","--disable-gpu","--disable-extensions","--disable-background-networking","--disable-default-apps","--disable-sync","--hide-scrollbars","--metrics-recording-only","--mute-audio","--safebrowsing-disable-auto-update","--single-process"],
+    },
+  });
+
+  client.on("qr", (qr) => { qrCodes[business.id] = qr; botStatus[business.id] = "qr"; qrcode.generate(qr, { small: true }); console.log(`📲 QR: ${business.name}`); });
+  client.on("ready", () => { botStatus[business.id] = "online"; delete qrCodes[business.id]; starting.delete(business.client_id); console.log(`✅ ONLINE: ${business.name}`); });
+  client.on("auth_failure", (m) => { console.error(`🔐 Auth failure [${business.name}]:`, m); starting.delete(business.client_id); delete clients[business.id]; botStatus[business.id] = "offline"; setTimeout(() => startClient(business, attempt + 1), Math.min(15000 * attempt, 120000)); });
+  client.on("disconnected", (r) => { console.log(`❌ Desconectado [${business.name}]: ${r}`); delete clients[business.id]; starting.delete(business.client_id); botStatus[business.id] = "offline"; setTimeout(() => startClient(business, attempt + 1), Math.min(10000 * attempt, 120000)); });
+
+  client.on("message", async (msg) => {
+    try {
+      if (!msg.body || msg.from.includes("@g.us") || msg.fromMe) return;
+      const phone = msg.from.replace("@c.us", "");
+      const text = msg.body.trim();
+      const normalized = normalizeText(text);
+      console.log(`📩 [${business.name}] ${phone}: ${text}`);
+
+      await pool.query(
+        `INSERT INTO messages (id, business_id, user_phone, from_me, message) VALUES ($1,$2,$3,$4,$5)`,
+        [uuidv4(), business.id, phone, false, text]
+      );
+
+      let { rows } = await pool.query("SELECT * FROM conversations WHERE business_id=$1 AND user_phone=$2", [business.id, phone]);
+      let conv = rows[0];
+
+      if (!conv) {
+        await createNotification(business.id, "new_contact", "Nuevo contacto", `+${phone} inició una conversación`, phone);
+        const r = await pool.query(
+          `INSERT INTO conversations (business_id, user_phone, current_step, mode) VALUES ($1,$2,'start','bot') RETURNING *`,
+          [business.id, phone]
+        );
+        conv = r.rows[0];
+      }
+
+      /* ── MODO HUMANO ── */
+      if (conv.mode === "human") {
+        if (normalized === "bot" || normalized === "menu" || normalized === "inicio") {
+          await pool.query(`UPDATE conversations SET mode='bot', current_step='start' WHERE id=$1`, [conv.id]);
+          const flow = await getBotFlow(business.id);
+          const startStep = flow?.steps?.find((s: any) => s.id === "start");
+          if (startStep) { await sleep(800); await msg.reply(startStep.message); }
+        }
+        return;
+      }
+
+      /* ── COMANDOS GLOBALES ── */
+      if (["hola","menu","inicio","start","comenzar","ayuda"].includes(normalized)) {
+        const flow = await getBotFlow(business.id);
+        const startStep = flow?.steps?.find((s: any) => s.id === "start");
+        if (!startStep) return;
+        await pool.query(`UPDATE conversations SET mode='bot', current_step='start', context_json='{}' WHERE id=$1`, [conv.id]);
+        await sleep(600 + Math.random() * 800);
+        await msg.reply(startStep.message);
+        return;
+      }
+
+      const flow = await getBotFlow(business.id);
+      if (!flow?.steps) return;
+
+      const currentStep = flow.steps.find((s: any) => s.id === conv.current_step);
+
+      /* ── FLUJO DE AGENDAMIENTO ACTIVO ── */
+      if (currentStep && getStepType(currentStep) === "agenda") {
+        const ctx = conv.context_json || {};
+        if (ctx.agenda) {
+          await handleAgendaFlow(msg, business, conv, currentStep, text);
+          return;
+        }
+      }
+
+      /* ── PROCESAR SIGUIENTE PASO ── */
+      const processStep = async (step: any): Promise<void> => {
+        const stepType = getStepType(step);
+        console.log(`📍 [${business.name}] ${phone} → paso '${step.id}' tipo '${stepType}'`);
+
+        switch (stepType) {
+
+          case "human": {
+            await pool.query(
+              `UPDATE conversations SET mode='human', current_step=$1, requests_human=true, human_taken_at=NOW() WHERE id=$2`,
+              [step.id, conv.id]
+            );
+            await createNotification(business.id, "human_request", "👤 Cliente solicita asesor", `+${phone} quiere hablar con un asesor`, phone);
+            await notifyOwner(business, phone, "human");
+            await sleep(800 + Math.random() * 1000);
+            await msg.reply(step.message);
+            break;
+          }
+
+          case "agenda": {
+            await pool.query(`UPDATE conversations SET current_step=$1 WHERE id=$2`, [step.id, conv.id]);
+            // Iniciar flujo de agendamiento
+            await handleAgendaFlow(msg, business, { ...conv, current_step: step.id }, step, text);
+            break;
+          }
+
+          case "location": {
+            await pool.query(`UPDATE conversations SET current_step=$1 WHERE id=$2`, [step.id, conv.id]);
+            let locationMsg = step.message || "";
+            if (step.metadata?.maps_url && step.metadata.maps_url.trim() !== "") {
+              locationMsg = locationMsg + "\n\n📍 " + step.metadata.maps_url;
+            }
+            await sleep(800 + Math.random() * 800);
+            await msg.reply(locationMsg);
+            break;
+          }
+
+          case "link": {
+            await pool.query(`UPDATE conversations SET current_step=$1 WHERE id=$2`, [step.id, conv.id]);
+            const linkMsg = step.metadata?.url
+              ? `${step.message}\n\n🔗 ${step.metadata.url}`
+              : step.message;
+            await sleep(800 + Math.random() * 800);
+            await msg.reply(linkMsg);
+            // Si no tiene opciones, volver al menú automáticamente
+            if (!step.next || Object.keys(step.next).length === 0) {
+              const startStep = flow.steps.find((s: any) => s.id === "start");
+              if (startStep) {
+                await sleep(1000);
+                await msg.reply(startStep.message);
+                await pool.query(`UPDATE conversations SET current_step='start' WHERE id=$1`, [conv.id]);
+              }
+            }
+            break;
+          }
+
+          case "collect": {
+            await pool.query(`UPDATE conversations SET current_step=$1 WHERE id=$2`, [step.id, conv.id]);
+            await sleep(800 + Math.random() * 800);
+            await msg.reply(step.message);
+            break;
+          }
+
+          case "message":
+          default: {
+            await pool.query(`UPDATE conversations SET current_step=$1 WHERE id=$2`, [step.id, conv.id]);
+            await sleep(800 + Math.random() * 1000);
+            await msg.reply(step.message);
+            // Si no tiene opciones, volver al menú automáticamente
+            if (!step.next || Object.keys(step.next).length === 0) {
+              const startStep = flow.steps.find((s: any) => s.id === "start");
+              if (startStep) {
+                await sleep(1200);
+                await msg.reply(`\n${startStep.message}`);
+                await pool.query(`UPDATE conversations SET current_step='start' WHERE id=$1`, [conv.id]);
+              }
+            }
+            break;
+          }
+        }
+      };
+
+      /* ── NAVEGACIÓN ── */
+      if (!currentStep || conv.current_step === "start") {
+        const startStep = flow.steps.find((s: any) => s.id === "start");
+        if (!startStep) return;
+        const nextId = matchOption(text, normalized, startStep.next || {});
+        if (!nextId) {
+          await pool.query(`UPDATE conversations SET current_step='start' WHERE id=$1`, [conv.id]);
+          await sleep(600 + Math.random() * 800);
+          await msg.reply(startStep.message);
+          return;
+        }
+        const nextStep = flow.steps.find((s: any) => s.id === nextId);
+        if (!nextStep) return;
+        await processStep(nextStep);
+        return;
+      }
+
+      // Paso actual tiene opciones — navegar
+      const nextId = matchOption(text, normalized, currentStep.next || {});
+      if (nextId) {
+        const nextStep = flow.steps.find((s: any) => s.id === nextId);
+        if (!nextStep) return;
+        await processStep(nextStep);
+        return;
+      }
+
+      // Si está en un paso collect, guardar el dato en context_json
+      if (getStepType(currentStep) === "collect") {
+        const ctx = conv.context_json || {};
+        const fieldName = currentStep.metadata?.field || currentStep.id;
+        ctx[fieldName] = text;
+        await pool.query(`UPDATE conversations SET context_json=$1 WHERE id=$2`, [JSON.stringify(ctx), conv.id]);
+
+        // Si tiene siguiente paso definido, ir a él
+        const nextKeys = Object.keys(currentStep.next || {});
+        if (nextKeys.length > 0) {
+          const nextStep = flow.steps.find((s: any) => s.id === currentStep.next[nextKeys[0]]);
+          if (nextStep) { await processStep(nextStep); return; }
+        }
+      }
+
+      await sleep(500 + Math.random() * 800);
+      await msg.reply("No entendí. Escribe *menu* para ver las opciones disponibles.");
+
+    } catch (err) { console.error(`🔥 ERROR [${business.name}]:`, err); }
+  });
+
+  try {
+    await client.initialize();
+    clients[business.id] = client;
+  } catch (err) {
+    console.error(`❌ initialize() falló [${business.name}] intento ${attempt}:`, err);
+    starting.delete(business.client_id);
+    delete clients[business.id];
+    botStatus[business.id] = "error";
+    setTimeout(() => startClient(business, attempt + 1), Math.min(15000 * attempt, 120000));
+  }
+}
+
+/* ================================================================
+   EXPRESS API INTERNA
+================================================================ */
+const app = express();
+app.use(express.json());
+
+app.get("/health", (_, res) => res.json({ ok: true, uptime: Math.floor(process.uptime()), clients: Object.keys(clients).length, statuses: botStatus }));
+app.get("/statuses", (_, res) => res.json(Object.keys(botStatus).map((id) => ({ businessId: id, status: botStatus[id], connected: !!clients[id], hasQr: !!qrCodes[id] }))));
+app.get("/status/:businessId", (req, res) => {
+  const { businessId } = req.params;
+  const status = botStatus[businessId] ?? "offline";
+  const hasClient = !!clients[businessId];
+  const qr = qrCodes[businessId] ?? null;
+  let finalStatus = "offline";
+  if (hasClient && status === "online") finalStatus = "online";
+  else if (qr) finalStatus = "qr";
+  else if (status === "starting" || status === "qr") finalStatus = "connecting";
+  res.json({ businessId, status: finalStatus, connected: hasClient && status === "online", hasQr: !!qr, qr });
+});
+app.get("/qr/:id", (req, res) => {
+  const qr = qrCodes[req.params.id];
+  const status = botStatus[req.params.id] ?? "offline";
+  if (!qr) return res.status(404).json({ error: "QR no disponible", status });
+  res.json({ qr, status });
+});
+app.post("/reload/:businessId", (req, res) => { reloadFlow(req.params.businessId); res.json({ ok: true }); });
+app.post("/start/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM businesses WHERE id=$1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Empresa no encontrada" });
+    startClient(rows[0]); res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+app.post("/restart/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM businesses WHERE id=$1", [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: "Empresa no encontrada" });
+    const { id, client_id } = rows[0];
+    if (clients[id]) { try { await clients[id].destroy(); } catch {} delete clients[id]; }
+    delete qrCodes[id]; botStatus[id] = "offline"; starting.delete(client_id); reloadFlow(id); cleanSessionLocks(client_id);
+    setTimeout(() => startClient(rows[0]), 3000); res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+app.post("/stop/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (clients[id]) { try { await clients[id].destroy(); } catch {} delete clients[id]; }
+    delete qrCodes[id]; botStatus[id] = "offline"; res.json({ ok: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+setInterval(async () => {
+  try {
+    const businesses = await getActiveBusinesses();
+    for (const b of businesses) {
+      if (!clients[b.id] && !starting.has(b.client_id) && botStatus[b.id] !== "error") startClient(b);
+    }
+  } catch (err) { console.error("AUTO-START ERROR:", err); }
+}, 15000);
+
+async function shutdown(signal: string) {
+  console.log(`\n🛑 ${signal} — cerrando clientes…`);
+  await Promise.allSettled(Object.entries(clients).map(async ([, c]) => { try { await c.destroy(); } catch {} }));
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
+
+app.listen(3333, "0.0.0.0", async () => {
+  console.log("🤖 BOT SERVICE RUNNING :3333");
+  try {
+    const businesses = await getActiveBusinesses();
+    console.log(`📋 Arrancando ${businesses.length} negocio(s)`);
+    for (const b of businesses) startClient(b);
+  } catch (err) { console.error("Error en arranque inicial:", err); }
+});
+

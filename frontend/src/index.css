@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 🌑 BASE GLOBAL */
+body {
+  @apply bg-[#0a0a0a] text-gray-200;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+/* 🎯 CARDS */
+.card {
+  @apply bg-[#111111] border border-gray-800 rounded-2xl shadow-lg;
+}
+
+/* 🎯 INPUT */
+.input {
+  @apply w-full px-4 py-3 bg-[#0f0f0f] border border-gray-700 rounded-lg text-white 
+  focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent transition;
+}
+
+/* 🎯 BUTTON */
+.btn-primary {
+  @apply w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 rounded-lg transition;
+}
+
+/* 🎯 SUBTEXTO */
+.muted {
+  @apply text-gray-400;
+}

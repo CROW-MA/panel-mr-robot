@@ -1,0 +1,74 @@
+# Secretos - NUNCA SUBIR
+.env
+.env.*
+*.env
+!*.env.example
+
+# Dependencias
+node_modules/
+vendor/
+__pycache__/
+*.pyc
+venv/
+env/
+.venv/
+
+# WhatsApp API
+whatsapp-session/
+*.session
+credentials.json
+token.json
+secrets/
+*.pem
+
+# Base de datos
+*.db
+*.sqlite
+*.sqlite3
+db.json
+
+# Logs
+logs/
+*.log
+celerybeat-schedule
+
+# IDE y OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Scripts de deploy (si tienen credenciales)
+deploy.sh
+start.sh
+stop.sh
+update.sh
+
+# Archivos específicos de WAAS
+api.log
+bot.log
+frontend.log
+waas.log
+bot-cleanup.sh
+start-all.sh
+start-pm2.sh
+stop-all.sh
+ecosystem.config.js
+docker-compose.yml
+
+# Caché y sesiones de WhatsApp
+bot/.wwebjs_cache/
+bot/sessions/
+bot/.wwebjs_auth/
+*.deb
+
+# Archivos de usuarios reales
+api/public/logos/
+api/public/campaigns/
+frontend/dist/
+
+# Configuraciones
+frontend/nginx.conf
+
+# Archivos misteriosos
+frontend/99
