@@ -1,4 +1,4 @@
-# 🚀 Panel ShoppyWorld - SaaS IA WhatsApp
+# 🚀 Panel Mr-Robot - SaaS IA WhatsApp
 
 **Automatización con Inteligencia Artificial para negocios. Tu negocio trabajando 24/7 mientras duermes.**
 
@@ -48,8 +48,8 @@ waas/
 
 ```bash
 # Clonar
-git clone https://github.com/CROW-MA/panel-shoppyworld.git
-cd panel-shoppyworld
+git clone https://github.com/CROW-MA/panel-mr-robot.git
+cd panel-mr-robot.store
 
 # Instalar dependencias
 npm install
@@ -79,18 +79,17 @@ STRIPE_SECRET_KEY	Clave secreta de Stripe
 SMTP_PASS	Contraseña de email
 🌐 URLs
 
-    🔗 Landing Page: https://panel.shoppyworld.site
+    🔗 Landing Page: https://panel.mr-robot.store
 
-    📊 Dashboard: https://panel.shoppyworld.site/dashboard
+    📊 Dashboard: https://panel.mr-robot.store
 
-    🔌 API: https://api.panel.shoppyworld.site
+    🔌 API: https://api.mr-robot.store
 
 📞 Soporte
 
 ¿Quieres automatizar tu negocio? Contáctanos:
 
-    📧 Email: soport@shoppyworld.site
-
+    📧 Email: willgensuarez7@gmail.com
     💬 WhatsApp: Escríbenos +57 3244990285
 
 Hecho con ❤️ por CROW-MA | Ethical Hacker & Full Stack Developer
